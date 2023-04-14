@@ -27,7 +27,6 @@ type ServerList struct {
 type Server struct {
 	IP        string    `json:"ipaddress"`
 	Status    string    `json:"status"`
-	Service   string    `json:"service"`
 	NotBefore time.Time `json:"notbefore"`
 	NotAfter  time.Time `json:"notafter"`
 }
@@ -35,18 +34,18 @@ type Server struct {
 func main() {
 
 	var serverList ServerList
-	ipList := readIpList() // get list of IPs from file
+	hostList := readHostList() // get list of IPs from file
 
-	ch := make(chan Server, len(ipList)) // create channel for go routines to send completed Server types back to
+	ch := make(chan Server, len(hostList)) // create channel for go routines to send completed Server types back to
 
 	var wg sync.WaitGroup // wait group to allow go routines to finish
-	wg.Add(len(ipList))
+	wg.Add(len(hostList))
 
-	for _, v := range ipList {
+	for _, v := range hostList {
 		go checkServerStatus(v, &wg, ch) // run server connectivity checks and build Server objects
 	}
 
-	for i := 0; i < len(ipList); i++ {
+	for i := 0; i < len(hostList); i++ {
 		serverList.Servers = append(serverList.Servers, <-ch) // pull Server objects from the channel into array
 	}
 
@@ -59,19 +58,9 @@ func main() {
 	sendSlackMessage(serverList) //send messages to slack
 }
 
-func parseCidr(cidr string) *net.IPNet {
-	// used for initially parsing the service network CIDRs
-	_, ipNet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		log.Fatal("ERROR: Could not initialize subnets")
-	}
-
-	return ipNet
-}
-
-func readIpList() []string {
+func readHostList() []string {
 	// read in the list of IPs from file
-	var ipList []string
+	var hostList []string
 
 	file, err := os.Open("ip_addresses.txt")
 	if err != nil {
@@ -83,10 +72,10 @@ func readIpList() []string {
 	scanner.Split(bufio.ScanLines)
 
 	for scanner.Scan() {
-		ipList = append(ipList, scanner.Text())
+		hostList = append(hostList, scanner.Text())
 	}
 
-	return ipList
+	return hostList
 }
 
 func checkServerStatus(ipAddress string, wg *sync.WaitGroup, ch chan Server) {
@@ -96,15 +85,8 @@ func checkServerStatus(ipAddress string, wg *sync.WaitGroup, ch chan Server) {
 	var server Server
 	server.IP = ipAddress
 
-	if targetPort == "" {
-		server.Status = "errored"
-		server.Service = "unknown"
-		ch <- server
-		return
-	}
-
 	// create ip:port string for connection
-	targetHost := fmt.Sprintf("%s:%s", ipAddress, targetPort)
+	targetHost := fmt.Sprintf("%s:%s", ipAddress, "443")
 
 	// set timeout so we don't hang on bad connections
 	timeout, _ := time.ParseDuration("5s")
@@ -112,7 +94,6 @@ func checkServerStatus(ipAddress string, wg *sync.WaitGroup, ch chan Server) {
 	if err != nil {
 		errorLogger.Printf("Could not create connection to '%s'", targetHost)
 		server.Status = "errored"
-		server.Service = service
 		ch <- server
 		return
 	}
@@ -125,14 +106,12 @@ func checkServerStatus(ipAddress string, wg *sync.WaitGroup, ch chan Server) {
 	if err != nil {
 		errorLogger.Printf("Could not complete handshake to '%s'", targetHost)
 		server.Status = "errored"
-		server.Service = service
 		ch <- server
 		return
 	}
 
 	// server can be reached and handshake complete - set status to good
 	server.Status = "good"
-	server.Service = service
 	// set notbefore and notafter fields for server based on cert values
 	server.NotBefore = client.ConnectionState().PeerCertificates[0].NotBefore
 	server.NotAfter = client.ConnectionState().PeerCertificates[0].NotAfter
@@ -140,23 +119,18 @@ func checkServerStatus(ipAddress string, wg *sync.WaitGroup, ch chan Server) {
 }
 
 func getCertificateStatus(serverList *ServerList) {
-	// take array of non-connection error Servers and determine status of certificate expiration
-	for i := 0; i < len(serverList.Servers); i++ {
+	currentTime := time.Now()
+	for i := range serverList.Servers {
 		if serverList.Servers[i].Status != "errored" {
-			currentTime := time.Now()
-			// check if cert was issued in past 7 days - assume NotBefore is the actual issue/deploy date
-			prevWeek := currentTime.Add(-168 * time.Hour)
-			if serverList.Servers[i].NotBefore.Before(prevWeek) {
-				serverList.Servers[i].Status = "outdated"
-			}
-			// check if cert expires within the next 30 days
-			thirtyDays := serverList.Servers[i].NotAfter.Add(-720 * time.Hour)
-			if currentTime.After(thirtyDays) {
-				serverList.Servers[i].Status = "expiring"
-			}
-			// check if cert is already expired
-			if currentTime.After(serverList.Servers[i].NotAfter) {
+			sevenDaysAgo := serverList.Servers[i].NotAfter.Add(-168 * time.Hour)
+			thirtyDaysAgo := serverList.Servers[i].NotAfter.Add(-720 * time.Hour)
+			switch {
+			case (currentTime.After(serverList.Servers[i].NotAfter)):
 				serverList.Servers[i].Status = "expired"
+			case (currentTime.After(sevenDaysAgo)):
+				serverList.Servers[i].Status = "seven_days"
+			case (currentTime.After(thirtyDaysAgo)):
+				serverList.Servers[i].Status = "thirty_days"
 			}
 		}
 	}
@@ -164,10 +138,10 @@ func getCertificateStatus(serverList *ServerList) {
 
 func sendSlackMessage(serverList ServerList) {
 	// arrays to hold the ips of servers based on status
-	outdated := []string{}
-	expiring := []string{}
-	expired := []string{}
 	errored := []string{}
+	sevenDays := []string{}
+	thirtyDays := []string{}
+	expired := []string{}
 	good := []string{}
 
 	// add the server ips to the correct arrays based on Server.Status
@@ -175,17 +149,17 @@ func sendSlackMessage(serverList ServerList) {
 		status := serverList.Servers[i].Status
 		serverIp := serverList.Servers[i].IP
 		switch status {
-		case "outdated":
-			outdated = append(outdated, serverIp)
-			warnLogger.Printf("cert for '%s' is outdated (>7 days since re-issue)", serverIp)
-		case "expiring":
-			expiring = append(expiring, serverIp)
+		case "errored":
+			errored = append(errored, serverIp)
+		case "seven_days":
+			sevenDays = append(sevenDays, serverIp)
+			warnLogger.Printf("cert for '%s' is expiring very soon (<7 days til expiration)", serverIp)
+		case "thirty_days":
+			thirtyDays = append(thirtyDays, serverIp)
 			warnLogger.Printf("cert for '%s' is expiring (<30 days til expiration)", serverIp)
 		case "expired":
 			expired = append(expired, serverIp)
 			warnLogger.Printf("cert for '%s' is expired", serverIp)
-		case "errored":
-			errored = append(errored, serverIp)
 		case "good":
 			good = append(good, serverIp)
 			infoLogger.Printf("cert for '%s' is good", serverIp)
@@ -193,15 +167,15 @@ func sendSlackMessage(serverList ServerList) {
 	}
 
 	infoLogger.Printf("GOOD: %v\n", good)
-	infoLogger.Printf("OUTDATED: %v\n", outdated)
-	infoLogger.Printf("EXPIRING: %v\n", expiring)
+	infoLogger.Printf("SEVENDAYS: %v\n", sevenDays)
+	infoLogger.Printf("THIRTYDAYS: %v\n", thirtyDays)
 	infoLogger.Printf("EXPIRED: %v\n", expired)
 	infoLogger.Printf("ERRORED: %v\n", errored)
 
 	// could also move these to separate template files
-	// outdated
-	if len(outdated) > 0 {
-		outdatedMessage := fmt.Sprintf(`
+	// sevenDays
+	if len(sevenDays) > 0 {
+		sevenDaysMessage := fmt.Sprintf(`
 		{
 		"blocks": [
 			{
@@ -223,14 +197,14 @@ func sendSlackMessage(serverList ServerList) {
 				}
 			}
 		]
-		}`, strings.Join(outdated, "*\\n*"))
-		outdatedJsonMessage := []byte(outdatedMessage)
-		postToSlack(outdatedJsonMessage)
+		}`, strings.Join(sevenDays, "*\\n*"))
+		sevenDaysJsonMessage := []byte(sevenDaysMessage)
+		postToSlack(sevenDaysJsonMessage)
 	}
 
-	// expiring
-	if len(expiring) > 0 {
-		expiringMessage := fmt.Sprintf(`
+	// thirtyDays
+	if len(thirtyDays) > 0 {
+		thirtyDaysMessage := fmt.Sprintf(`
 		{
 		"blocks": [
 			{
@@ -256,9 +230,9 @@ func sendSlackMessage(serverList ServerList) {
 				}
 			}
 		]
-		}`, strings.Join(expiring, "*\\n*"))
-		expiringJsonMessage := []byte(expiringMessage)
-		postToSlack(expiringJsonMessage)
+		}`, strings.Join(thirtyDays, "*\\n*"))
+		thirtyDaysJsonMessage := []byte(thirtyDaysMessage)
+		postToSlack(thirtyDaysJsonMessage)
 	}
 
 	// expired

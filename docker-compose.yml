@@ -1,0 +1,79 @@
+services:
+  certchecker:
+    image: golang:1.20.1
+    volumes:
+      - type: bind
+        source: ./
+        target: /scripts
+    networks:
+      certcheck:
+        ipv4_address: 192.168.1.5
+    working_dir: /scripts
+    command: ["sleep", "10000"]
+
+  good:
+    image: ubuntu:22.04
+    volumes:
+      - type: bind
+        source: ./
+        target: /scripts
+    networks:
+      certcheck:
+        ipv4_address: 192.168.1.10
+    working_dir: /scripts
+    command: ["/bin/bash", "bootscripts/good.sh"]
+
+  sevendays:
+    image: ubuntu:22.04
+    volumes:
+      - type: bind
+        source: ./
+        target: /scripts
+    networks:
+      certcheck:
+        ipv4_address: 192.168.1.11
+    working_dir: /scripts
+    command: ["/bin/bash", "bootscripts/sevendays.sh"]
+
+  thirtydays:
+    image: ubuntu:22.04
+    volumes:
+      - type: bind
+        source: ./
+        target: /scripts
+    networks:
+      certcheck:
+        ipv4_address: 192.168.1.12
+    working_dir: /scripts
+    command: ["/bin/bash", "bootscripts/thirtydays.sh"]
+
+  thirtydays:
+    image: ubuntu:22.04
+    volumes:
+      - type: bind
+        source: ./
+        target: /scripts
+    networks:
+      certcheck:
+        ipv4_address: 192.168.1.12
+    working_dir: /scripts
+    command: ["/bin/bash", "bootscripts/thirtydays.sh"]
+
+  expired:
+    image: ubuntu:22.04
+    volumes:
+      - type: bind
+        source: ./
+        target: /scripts
+    networks:
+      certcheck:
+        ipv4_address: 192.168.1.13
+    working_dir: /scripts
+    command: ["/bin/bash", "bootscripts/expired.sh"]
+
+networks:
+  certcheck:
+    ipam:
+      driver: default
+      config:
+        - subnet: "192.168.1.0/24"
